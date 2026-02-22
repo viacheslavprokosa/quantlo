@@ -33,7 +33,6 @@ func main() {
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Qantlo Engine is running!"))
 	})
 
 	fmt.Printf("🟢 Server is running on port :%s\n", port)
