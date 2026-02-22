@@ -1,27 +1,37 @@
-Qantlo
+# Qantlo
 
-High-concurrency agnostic microservice for atomic resource metering and real-time balancing.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+
+**High-concurrency agnostic microservice for atomic resource metering and real-time balancing.**
 
 Qantlo is a specialized ledger engine designed to handle massive streams of consumption requests. It provides atomic "spend" operations, idempotent transaction processing, and precise balance tracking for any digital or physical unit (API credits, GPU-hours, traffic, or even milliliters).
 
-✨ Key Features
-⚡ High Concurrency: Engineered to handle thousands of simultaneous decrement requests to the same account balance without race conditions.
+---
 
-💎 Atomic Operations: Ensures data integrity using ACID transactions or atomic scripts (Redis/Lua), preventing "double-spending" or negative balances.
+## 💡 Why Qantlo?
 
-🔗 Agnostic Metering: Works with any units. Define your own resource types: tokens, liters, seconds, requests, etc.
+Building custom ledger logic for every project is error-prone and hard to scale. Qantlo solve this by providing a robust, high-performance, and scalable solution for tracking any resource balance, allowing you to focus on your core business logic.
 
-🛡️ Idempotency Built-in: Native support for Idempotency-Key to safely retry transactions in unstable network conditions.
+## ✨ Key Features
 
-📊 Real-time Analytics: Instant access to current balances and historical usage reports.
+- ⚡ **High Concurrency**: Engineered to handle thousands of simultaneous decrement requests to the same account balance without race conditions.
+- 💎 **Atomic Operations**: Ensures data integrity using ACID transactions or atomic scripts (Redis/Lua), preventing "double-spending" or negative balances.
+- 🔗 **Agnostic Metering**: Works with any units. Define your own resource types: tokens, liters, seconds, requests, etc.
+- 🛡️ **Idempotency Built-in**: Native support for `Idempotency-Key` to safely retry transactions in unstable network conditions.
+- 📊 **Real-time Analytics**: Instant access to current balances and historical usage reports.
 
-🚀 Quick Start
+---
 
-1. Deposit Tokens (Top-up)
+## 🚀 Quick Start
+
+### 1. Deposit Tokens (Top-up)
+
 Add units to a specific account.
 
-Bash
-curl -X POST <https://api.qantlo.io/v1/deposit> \
+```bash
+curl -X POST https://api.qantlo.io/v1/deposit \
   -H "Content-Type: application/json" \
   -d '{
     "account_id": "user_42",
@@ -29,11 +39,14 @@ curl -X POST <https://api.qantlo.io/v1/deposit> \
     "amount": 1000,
     "metadata": { "reason": "subscription_refill" }
   }'
-2. Spend Tokens (The Hot Path)
-The main endpoint for high-frequency consumption.
+```
 
-Bash
-curl -X POST <https://api.qantlo.io/v1/spend> \
+### 2. Spend Tokens (The Hot Path)
+
+The main endpoint for high-frequency consumption with built-in idempotency.
+
+```bash
+curl -X POST https://api.qantlo.io/v1/spend \
   -H "Content-Type: application/json" \
   -H "X-Idempotency-Key: uuid-string-123" \
   -d '{
@@ -42,25 +55,45 @@ curl -X POST <https://api.qantlo.io/v1/spend> \
     "amount": 1,
     "metadata": { "service": "llm-inference" }
   }'
-3. Check Balance
-Get the current state of a specific resource.
+```
 
-Bash
-curl <https://api.qantlo.io/v1/balance/user_42/api_credits>
-🛠 Architecture Overview
-Qantlo is designed to be a "middleman" between your business logic and your data persistence.
+### 3. Check Balance
 
-API Layer: Fast HTTP/gRPC interface.
+Get the current state of a specific resource instantly.
 
-Concurrency Control: Uses distributed locking or atomic counters to manage hot-keys (popular accounts).
+```bash
+curl https://api.qantlo.io/v1/balance/user_42/api_credits
+```
 
-Persistence: Records every transaction into a relational database (PostgreSQL) or a specialized OLAP store (ClickHouse) for heavy reporting.
+---
 
-📈 Use Cases
-SaaS Billing: Track API usage and enforce rate limits based on pre-paid credits.
+## 🛠 Architecture Overview
 
-Cloud Infrastructure: Metering CPU/RAM seconds for serverless functions.
+Qantlo is designed to be a high-performance "middleman" between your business logic and your data persistence.
 
-IoT Platforms: Monitoring resource consumption (water, electricity, data) across millions of devices.
+### API Layer
 
-Gaming: Managing in-game currencies and energy points.
+Fast HTTP/gRPC interface designed for low-latency response times.
+
+### Concurrency Control
+
+Uses distributed locking or atomic counters to manage "hot-keys" (popular accounts with high-frequency updates).
+
+### Persistence
+
+Records every transaction into a relational database (**PostgreSQL**) or a specialized OLAP store (**ClickHouse**) for heavy reporting and audit trails.
+
+---
+
+## 📈 Use Cases
+
+- **SaaS Billing**: Track API usage and enforce rate limits based on pre-paid credits.
+- **Cloud Infrastructure**: Metering CPU/RAM seconds for serverless functions.
+- **IoT Platforms**: Monitoring resource consumption (water, electricity, data) across millions of devices.
+- **Gaming**: Managing in-game currencies, experience points, and energy levels.
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
