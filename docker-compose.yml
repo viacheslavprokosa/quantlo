@@ -1,35 +1,66 @@
 version: '3.8'
 
+networks:
+  qantlo_net:
+    driver: bridge
+
 services:
   postgres:
     image: postgres:17
     container_name: qantlo_postgres
     environment:
-      POSTGRES_USER: qantlo_user
-      POSTGRES_PASSWORD: qantlo_password
-      POSTGRES_DB: qantlo_db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - qantlo_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:8.2
     container_name: qantlo_redis
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT}:6379"
     command: redis-server --save 60 1 --loglevel warning
+    networks:
+      - qantlo_net
     restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   nats:
     image: nats:2.10
     container_name: qantlo_nats
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "${NATS_PORT}:4222"
+      - "${NATS_MONITOR_PORT}:8222"
     command: "-js"
+    networks:
+      - qantlo_net
     restart: unless-stopped
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pgdata:
+  redisdata:
+  natsdata:
