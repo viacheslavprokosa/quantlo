@@ -3,11 +3,14 @@ package repository
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -17,12 +20,14 @@ var spendLuaScript string
 type LedgerRepo struct {
 	redisClient *redis.Client
 	dbPool      *pgxpool.Pool
+	natsConn    *nats.Conn
 }
 
-func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool) *LedgerRepo {
+func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool, natsConn *nats.Conn) *LedgerRepo {
 	return &LedgerRepo{
 		redisClient: rdb,
 		dbPool:      db,
+		natsConn:    natsConn,
 	}
 }
 
@@ -81,7 +86,17 @@ func (r *LedgerRepo) executeLua(ctx context.Context, accountID, resourceType, id
 
 	switch statusCode {
 	case 1:
-		return &SpendResult{NewBalance: resArray[1].(int64), Status: "SUCCESS"}, nil
+		newBalance := resArray[1].(int64)
+		event := SpendEvent{
+			AccountID:      accountID,
+			ResourceType:   resourceType,
+			Amount:         amount,
+			IdempotencyKey: idempotencyKey,
+			CreatedAt:      time.Now(),
+		}
+		eventData, _ := json.Marshal(event)
+		_ = r.natsConn.Publish("transactions.created", eventData)
+		return &SpendResult{NewBalance: newBalance, Status: "SUCCESS"}, nil
 	case 0:
 		return nil, ErrAlreadyProcessed
 	case -1:

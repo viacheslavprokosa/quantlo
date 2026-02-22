@@ -9,10 +9,12 @@ import (
 	"os"
 	"time"
 
-	"qantlo/internal/repository"
+	"quantlo/internal/repository"
+	"quantlo/internal/worker"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -42,6 +44,9 @@ func main() {
 	dbUser := getEnv("POSTGRES_USER", "postgres")
 	dbPass := getEnv("POSTGRES_PASSWORD", "postgres")
 	dbName := getEnv("POSTGRES_DB", "qantlo")
+	natsHost := getEnv("NATS_HOST", "localhost")
+	natsPort := getEnv("NATS_PORT", "4222")
+
 	port := getEnv("API_PORT", "8080")
 
 	rdb := redis.NewClient(&redis.Options{
@@ -65,7 +70,18 @@ func main() {
 		log.Fatalf("Database is not responding: %v", err)
 	}
 
-	ledgerRepo := repository.NewLedgerRepo(rdb, dbPool)
+    nc, err := nats.Connect("nats://" + natsHost + ":" + natsPort)
+    if err != nil {
+        log.Fatalf("Error connecting to NATS: %v", err)
+    }
+    defer nc.Close()
+
+	ledgerRepo := repository.NewLedgerRepo(rdb, dbPool, nc)
+
+	txWorker := worker.NewTransactionWorker(dbPool, nc)
+    if err := txWorker.Start(ctx); err != nil {
+        log.Fatalf("Error starting transaction worker: %v", err)
+    }
 	mux := http.NewServeMux()
 
 	// Health-check endpoint
