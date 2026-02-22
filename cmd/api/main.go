@@ -70,18 +70,18 @@ func main() {
 		log.Fatalf("Database is not responding: %v", err)
 	}
 
-    nc, err := nats.Connect("nats://" + natsHost + ":" + natsPort)
-    if err != nil {
-        log.Fatalf("Error connecting to NATS: %v", err)
-    }
-    defer nc.Close()
+	nc, err := nats.Connect("nats://" + natsHost + ":" + natsPort)
+	if err != nil {
+		log.Fatalf("Error connecting to NATS: %v", err)
+	}
+	defer nc.Close()
 
 	ledgerRepo := repository.NewLedgerRepo(rdb, dbPool, nc)
 
 	txWorker := worker.NewTransactionWorker(dbPool, nc)
-    if err := txWorker.Start(ctx); err != nil {
-        log.Fatalf("Error starting transaction worker: %v", err)
-    }
+	if err := txWorker.Start(ctx); err != nil {
+		log.Fatalf("Error starting transaction worker: %v", err)
+	}
 	mux := http.NewServeMux()
 
 	// Health-check endpoint
@@ -108,14 +108,14 @@ func main() {
 
 		// Handle expected business logic errors
 		if err != nil {
-			switch {
-			case err == repository.ErrInsufficient:
+			switch err {
+			case repository.ErrInsufficient:
 				w.WriteHeader(http.StatusPaymentRequired)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Insufficient funds"})
-			case err == repository.ErrAlreadyProcessed:
+			case repository.ErrAlreadyProcessed:
 				w.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request already processed"})
-			case err == repository.ErrNotFoundInDB:
+			case repository.ErrNotFoundInDB:
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Account not found in the system"})
 			default:
