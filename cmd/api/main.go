@@ -5,6 +5,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+
+	"encoding/json"
+
 	"github.com/joho/godotenv"
 )
 
@@ -14,6 +17,14 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
+
+type SpendRequest struct {
+	AccountID      string `json:"account_id"`
+	ResourceType   string `json:"resource_type"`
+	Amount         int64  `json:"amount"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
 func main() {
 	_ = godotenv.Load()
 
