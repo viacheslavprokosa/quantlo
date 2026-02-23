@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
-
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
@@ -17,23 +17,9 @@ import (
 //go:embed spend.lua
 var spendLuaScript string
 
-type LedgerRepo struct {
-	redisClient *redis.Client
-	dbPool      *pgxpool.Pool
-	natsConn    *nats.Conn
-}
-
-func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool, natsConn *nats.Conn) *LedgerRepo {
-	return &LedgerRepo{
-		redisClient: rdb,
-		dbPool:      db,
-		natsConn:    natsConn,
-	}
-}
-
 type SpendResult struct {
-	NewBalance int64
-	Status     string
+	NewBalance int64  `json:"new_balance"`
+	Status     string `json:"status"`
 }
 
 var (
@@ -43,59 +29,123 @@ var (
 	ErrNotFoundInDB     = errors.New("account not found in database")
 )
 
-// Spend calls the Lua script. If the cache is empty, it fetches data from the DB and retries.
+type LedgerRepo struct {
+	rdb      *redis.Client
+	db       *pgxpool.Pool
+	natsConn *nats.Conn
+}
+
+func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool, natsConn *nats.Conn) *LedgerRepo {
+	return &LedgerRepo{
+		rdb:      rdb,
+		db:       db,
+		natsConn: natsConn,
+	}
+}
+
 func (r *LedgerRepo) Spend(ctx context.Context, accountID, resourceType, idempotencyKey string, amount int64) (*SpendResult, error) {
 	result, err := r.executeLua(ctx, accountID, resourceType, idempotencyKey, amount)
 
-	// If we got ErrCacheMiss (our status -1), go to the database!
 	if errors.Is(err, ErrCacheMiss) {
-		log.Printf("Cold start for %s:%s. Going to PostgreSQL...", accountID, resourceType)
+		slog.Info("cold start, warming up cache", "account_id", accountID, "resource", resourceType)
 
-		err = r.warmUpCache(ctx, accountID, resourceType)
-		if err != nil {
+		if err := r.warmUpCache(ctx, accountID, resourceType); err != nil {
 			return nil, err
 		}
 
-		// Cache is "warmed up", repeat the Lua script call
-		log.Println("Repeating deduction after cache warmup...")
 		return r.executeLua(ctx, accountID, resourceType, idempotencyKey, amount)
 	}
 
 	return result, err
 }
 
-// executeLua is our old logic, extracted into a private function
+func (r *LedgerRepo) Recharge(ctx context.Context, accountID, resourceType string, amount int64) error {
+	query := `
+		UPDATE balances 
+		SET amount = amount + $1, updated_at = NOW() 
+		WHERE account_id = $2 AND resource_type = $3`
+
+	res, err := r.db.Exec(ctx, query, amount, accountID, resourceType)
+	if err != nil {
+		return fmt.Errorf("db recharge error: %w", err)
+	}
+
+	if res.RowsAffected() == 0 {
+		return ErrNotFoundInDB
+	}
+
+	cacheKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
+	if err := r.rdb.Del(ctx, cacheKey).Err(); err != nil {
+		slog.Error("failed to invalidate cache", "key", cacheKey, "error", err)
+	}
+
+	slog.Info("balance recharged successfully", "account_id", accountID, "amount", amount)
+	return nil
+}
+
+func (r *LedgerRepo) SyncTransactionWithBalance(ctx context.Context, event SpendEvent) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var insertedKey string
+	queryInsert := `
+		INSERT INTO transactions (account_id, resource_type, amount, idempotency_key, created_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (idempotency_key) DO NOTHING
+		RETURNING idempotency_key`
+
+	err = tx.QueryRow(ctx, queryInsert,
+		event.AccountID, event.ResourceType, event.Amount, event.IdempotencyKey, event.CreatedAt,
+	).Scan(&insertedKey)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("transaction insert failed: %w", err)
+	}
+
+	if insertedKey == "" {
+		slog.Debug("skipping duplicate transaction", "key", event.IdempotencyKey)
+		return nil
+	}
+
+	queryUpdate := `
+		UPDATE balances 
+		SET amount = amount - $1, updated_at = NOW() 
+		WHERE account_id = $2 AND resource_type = $3`
+
+	res, err := tx.Exec(ctx, queryUpdate, event.Amount, event.AccountID, event.ResourceType)
+	if err != nil {
+		return fmt.Errorf("balance update failed: %w", err)
+	}
+
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("no balance record to update for %s", event.AccountID)
+	}
+
+	return tx.Commit(ctx)
+}
+
 func (r *LedgerRepo) executeLua(ctx context.Context, accountID, resourceType, idempotencyKey string, amount int64) (*SpendResult, error) {
 	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
 	idemKey := fmt.Sprintf("idem:%s", idempotencyKey)
 
-	keys := []string{balanceKey, idemKey}
-	args := []interface{}{amount}
-
-	result, err := r.redisClient.Eval(ctx, spendLuaScript, keys, args...).Result()
+	result, err := r.rdb.Eval(ctx, spendLuaScript, []string{balanceKey, idemKey}, amount).Result()
 	if err != nil {
-		return nil, fmt.Errorf("error executing Lua script: %w", err)
+		return nil, fmt.Errorf("lua error: %w", err)
 	}
 
 	resArray, ok := result.([]interface{})
 	if !ok || len(resArray) < 2 {
-		return nil, errors.New("unexpected response format from Redis")
+		return nil, errors.New("invalid redis response format")
 	}
 
-	statusCode := resArray[0].(int64)
-
-	switch statusCode {
+	status := resArray[0].(int64)
+	switch status {
 	case 1:
 		newBalance := resArray[1].(int64)
-		event := SpendEvent{
-			AccountID:      accountID,
-			ResourceType:   resourceType,
-			Amount:         amount,
-			IdempotencyKey: idempotencyKey,
-			CreatedAt:      time.Now(),
-		}
-		eventData, _ := json.Marshal(event)
-		_ = r.natsConn.Publish("transactions.created", eventData)
+		r.publishEvent(accountID, resourceType, idempotencyKey, amount)
 		return &SpendResult{NewBalance: newBalance, Status: "SUCCESS"}, nil
 	case 0:
 		return nil, ErrAlreadyProcessed
@@ -104,33 +154,36 @@ func (r *LedgerRepo) executeLua(ctx context.Context, accountID, resourceType, id
 	case -2:
 		return nil, ErrInsufficient
 	default:
-		return nil, fmt.Errorf("unknown status from Lua: %d", statusCode)
+		return nil, fmt.Errorf("unknown lua status: %d", status)
 	}
 }
 
-// warmUpCache fetches the balance from Postgres and puts it into Redis
 func (r *LedgerRepo) warmUpCache(ctx context.Context, accountID, resourceType string) error {
 	var currentBalance int64
-
-	// Perform SELECT from our balances table
 	query := `SELECT amount FROM balances WHERE account_id = $1 AND resource_type = $2`
-	err := r.dbPool.QueryRow(ctx, query, accountID, resourceType).Scan(&currentBalance)
+	err := r.db.QueryRow(ctx, query, accountID, resourceType).Scan(&currentBalance)
 
 	if err != nil {
-		// If the record doesn't exist in the DB at all
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFoundInDB
 		}
-		return fmt.Errorf("database query error: %w", err)
+		return fmt.Errorf("db warmup query error: %w", err)
 	}
 
-	// Write the found balance to Redis.
-	// We don't set an expiration (TTL) because this is the primary cache.
 	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-	err = r.redisClient.Set(ctx, balanceKey, currentBalance, 0).Err()
-	if err != nil {
-		return fmt.Errorf("failed to save balance to Redis: %w", err)
-	}
+	return r.rdb.Set(ctx, balanceKey, currentBalance, 0).Err()
+}
 
-	return nil
+func (r *LedgerRepo) publishEvent(accID, resType, idemKey string, amount int64) {
+	event := SpendEvent{
+		AccountID:      accID,
+		ResourceType:   resType,
+		Amount:         amount,
+		IdempotencyKey: idemKey,
+		CreatedAt:      time.Now(),
+	}
+	data, _ := json.Marshal(event)
+	if err := r.natsConn.Publish("transactions.created", data); err != nil {
+		slog.Error("nats publish failed", "error", err, "key", idemKey)
+	}
 }

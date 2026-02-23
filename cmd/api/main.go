@@ -3,16 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	"quantlo/internal/config"
 	"quantlo/internal/repository"
 	"quantlo/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 )
 
 type SpendRequest struct {
@@ -22,110 +27,137 @@ type SpendRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
+type RechargeRequest struct {
+	AccountID    string `json:"account_id"`
+	ResourceType string `json:"resource_type"`
+	Amount       int64  `json:"amount"`
+}
+
 func main() {
-	_ = godotenv.Load()
+	//Logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
-	ctx := context.Background()
+	// Context for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
+	// Load config
 	cfg, err := config.New()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		slog.Error("Failed to load config", "error", err)
+		os.Exit(1)
 	}
 
 	// Database connection
-	dsn := cfg.DSN()
-	dbPool, err := pgxpool.New(ctx, dsn)
-
+	dbPool, err := pgxpool.New(ctx, cfg.DSN())
 	if err != nil {
-		log.Fatalf("Failed to create DB connection pool: %v", err)
+		slog.Error("Database connection failed", "error", err)
+		os.Exit(1)
 	}
 	defer dbPool.Close()
 
-	if err := dbPool.Ping(ctx); err != nil {
-		log.Fatalf("Database is not responding: %v", err)
-	}
-
 	// Redis connection
-	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr(),
-	})
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Error connecting to Redis: %v", err)
-	}
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr()})
+	defer rdb.Close()
 
 	// NATS connection
 	nc, err := nats.Connect(cfg.NatsAddr())
 	if err != nil {
-		log.Fatalf("Error connecting to NATS: %v", err)
+		slog.Error("NATS connection failed", "error", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
 	// Ledger repository
 	ledgerRepo := repository.NewLedgerRepo(rdb, dbPool, nc)
+	txWorker := worker.NewTransactionWorker(ledgerRepo, nc)
 
-	// Transaction worker
-	txWorker := worker.NewTransactionWorker(dbPool, nc)
-	if err := txWorker.Start(ctx); err != nil {
-		log.Fatalf("Error starting transaction worker: %v", err)
-	}
+	// Group goroutines (Worker + Server)
+	g, ctx := errgroup.WithContext(ctx)
 
-	// HTTP server
+	// --- GOROUTINE 1: WORKER ---
+	g.Go(func() error {
+		slog.Info("Worker starting...")
+		return txWorker.Run(ctx)
+	})
+
 	mux := http.NewServeMux()
-
-	// Health-check endpoint
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte("Qantlo Engine is running!"))
-		if err != nil {
-			log.Printf("Error writing response: %v", err)
-		}
-	})
-
-	// Main token deduction method
-	mux.HandleFunc("POST /spend", func(w http.ResponseWriter, r *http.Request) {
-		var req SpendRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		// Call our business logic (including "cold start")
-		result, err := ledgerRepo.Spend(r.Context(), req.AccountID, req.ResourceType, req.IdempotencyKey, req.Amount)
-
-		w.Header().Set("Content-Type", "application/json")
-
-		// Handle expected business logic errors
-		if err != nil {
-			switch err {
-			case repository.ErrInsufficient:
-				w.WriteHeader(http.StatusPaymentRequired)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Insufficient funds"})
-			case repository.ErrAlreadyProcessed:
-				w.WriteHeader(http.StatusConflict)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request already processed"})
-			case repository.ErrNotFoundInDB:
-				w.WriteHeader(http.StatusNotFound)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Account not found in the system"})
-			default:
-				log.Printf("Internal error: %v", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Something went wrong"})
-			}
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(result)
-	})
+	setupRoutes(mux, ledgerRepo)
 
 	server := &http.Server{
 		Addr:         cfg.ApiAddr(),
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
+
 	}
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Server error: %v", err)
+
+	// --- GOROUTINE 2: HTTP SERVER ---
+	g.Go(func() error {
+		slog.Info("HTTP Server starting", "addr", cfg.ApiAddr())
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("server error: %w", err)
+		}
+		return nil
+	})
+
+	// --- GOROUTINE 3: GRACEFUL SHUTDOWN ---
+	g.Go(func() error {
+		<-ctx.Done()
+		slog.Info("Shutting down gracefully...")
+
+		// Create a separate context for 10 seconds to complete tasks
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Server forced shutdown", "error", err)
+			return err
+		}
+		slog.Info("Server stopped clean")
+		return nil
+	})
+
+	// Wait for all processes in the group to complete
+	if err := g.Wait(); err != nil {
+		slog.Error("Application finished with error", "error", err)
+	} else {
+		slog.Info("Application exited successfully")
 	}
+}
+
+func setupRoutes(mux *http.ServeMux, repo *repository.LedgerRepo) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	mux.HandleFunc("POST /spend", func(w http.ResponseWriter, r *http.Request) {
+		var req SpendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		res, err := repo.Spend(r.Context(), req.AccountID, req.ResourceType, req.IdempotencyKey, req.Amount)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(res)
+	})
+
+	mux.HandleFunc("POST /recharge", func(w http.ResponseWriter, r *http.Request) {
+		var req RechargeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		if err := repo.Recharge(r.Context(), req.AccountID, req.ResourceType, req.Amount); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 }
