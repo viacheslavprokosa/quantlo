@@ -13,7 +13,7 @@ import (
 //go:embed migrations/*.sql
 var embedMigrations embed.FS
 
-func RunMigrations(ctx context.Context, dsn string, command string, args ...string) error {
+func RunMigrations(ctx context.Context, dsn string, command string) error {
 	migrationCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -29,13 +29,11 @@ func RunMigrations(ctx context.Context, dsn string, command string, args ...stri
 		return fmt.Errorf("failed to set dialect: %w", err)
 	}
 
-	fmt.Println("Starting migrations...", command, args)
+	fmt.Println("Starting migrations...", command)
 
-	if err := goose.RunContext(migrationCtx, command, db, "migrations", args...); err != nil {
+	if err := goose.RunContext(migrationCtx, command, db, "migrations"); err != nil {
 		return fmt.Errorf("goose up: %w", err)
 	}
-
-	fmt.Println("Migrations applied successfully")
 
 	return nil
 }
