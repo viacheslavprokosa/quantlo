@@ -3,27 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"time"
-
+	"quantlo/internal/config"
 	"quantlo/internal/repository"
 	"quantlo/internal/worker"
-
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 )
-
-func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return fallback
-}
 
 type SpendRequest struct {
 	AccountID      string `json:"account_id"`
@@ -37,28 +27,13 @@ func main() {
 
 	ctx := context.Background()
 
-	redisHost := getEnv("REDIS_HOST", "localhost")
-	redisPort := getEnv("REDIS_PORT", "6379")
-	dbHost := getEnv("POSTGRES_HOST", "localhost")
-	dbPort := getEnv("POSTGRES_PORT", "5432")
-	dbUser := getEnv("POSTGRES_USER", "postgres")
-	dbPass := getEnv("POSTGRES_PASSWORD", "postgres")
-	dbName := getEnv("POSTGRES_DB", "qantlo")
-	natsHost := getEnv("NATS_HOST", "localhost")
-	natsPort := getEnv("NATS_PORT", "4222")
-
-	port := getEnv("API_PORT", "8080")
-
-	rdb := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
-	})
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Error connecting to Redis: %v", err)
+	cfg, err := config.New()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", dbUser, dbPass, dbHost, dbPort, dbName)
-
+	// Database connection
+	dsn := cfg.DSN()
 	dbPool, err := pgxpool.New(ctx, dsn)
 
 	if err != nil {
@@ -70,18 +45,32 @@ func main() {
 		log.Fatalf("Database is not responding: %v", err)
 	}
 
-	nc, err := nats.Connect("nats://" + natsHost + ":" + natsPort)
+	// Redis connection
+	rdb := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr(),
+	})
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("Error connecting to Redis: %v", err)
+	}
+
+	// NATS connection
+	nc, err := nats.Connect(cfg.NatsAddr())
 	if err != nil {
 		log.Fatalf("Error connecting to NATS: %v", err)
 	}
 	defer nc.Close()
 
+	// Ledger repository
 	ledgerRepo := repository.NewLedgerRepo(rdb, dbPool, nc)
 
+	// Transaction worker
 	txWorker := worker.NewTransactionWorker(dbPool, nc)
 	if err := txWorker.Start(ctx); err != nil {
 		log.Fatalf("Error starting transaction worker: %v", err)
 	}
+
+	// HTTP server
 	mux := http.NewServeMux()
 
 	// Health-check endpoint
@@ -131,7 +120,7 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:         ":" + port,
+		Addr:         cfg.ApiAddr(),
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
