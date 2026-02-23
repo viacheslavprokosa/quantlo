@@ -127,37 +127,116 @@ func main() {
 	}
 }
 
+
+
 func setupRoutes(mux *http.ServeMux, repo *repository.LedgerRepo) {
+	// --- Health ---
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
 
+	// --- Spend ---
 	mux.HandleFunc("POST /spend", func(w http.ResponseWriter, r *http.Request) {
 		var req SpendRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json", 400)
+			respondWithError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		res, err := repo.Spend(r.Context(), req.AccountID, req.ResourceType, req.IdempotencyKey, req.Amount)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		json.NewEncoder(w).Encode(res)
+		respondWithJSON(w, http.StatusOK, res)
 	})
 
+	// --- Recharge ---
 	mux.HandleFunc("POST /recharge", func(w http.ResponseWriter, r *http.Request) {
 		var req RechargeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json", 400)
+			respondWithError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if err := repo.Recharge(r.Context(), req.AccountID, req.ResourceType, req.Amount); err != nil {
-			http.Error(w, err.Error(), 500)
+			respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		respondWithJSON(w, http.StatusOK, map[string]string{"status": "success"})
 	})
+
+	// --- Balance ---
+	mux.HandleFunc("GET /balance", func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.URL.Query().Get("account_id")
+		resType := r.URL.Query().Get("resource_type")
+
+		if accountID == "" || resType == "" {
+			respondWithError(w, http.StatusBadRequest, "missing account_id or resource_type")
+			return
+		}
+
+		balance, err := repo.GetBalance(r.Context(), accountID, resType)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, repository.ErrNotFoundInDB) {
+				status = http.StatusNotFound
+			}
+			respondWithError(w, status, err.Error())
+			return
+		}
+
+		respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"account_id":    accountID,
+			"resource_type": resType,
+			"balance":       balance,
+		})
+	})
+
+	// --- Create Account ---
+	mux.HandleFunc("POST /accounts", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			AccountID    string `json:"account_id"`
+			ResourceType string `json:"resource_type"`
+			Amount       int64  `json:"initial_amount"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondWithError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+
+		if err := repo.CreateAccount(r.Context(), req.AccountID, req.ResourceType, req.Amount); err != nil {
+			respondWithError(w, http.StatusConflict, err.Error())
+			return
+		}
+		respondWithJSON(w, http.StatusCreated, map[string]string{"status": "created"})
+	})
+
+	// --- Delete Account ---
+	mux.HandleFunc("DELETE /accounts", func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.URL.Query().Get("account_id")
+		resType := r.URL.Query().Get("resource_type")
+
+		if accountID == "" || resType == "" {
+			respondWithError(w, http.StatusBadRequest, "missing account_id or resource_type")
+			return
+		}
+
+		if err := repo.DeleteAccount(r.Context(), accountID, resType); err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondWithJSON(w, http.StatusNoContent, nil)
+	})
+}
+
+func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if payload != nil {
+		json.NewEncoder(w).Encode(payload)
+	}
+}
+
+func respondWithError(w http.ResponseWriter, status int, message string) {
+	respondWithJSON(w, status, map[string]string{"error": message})
 }
