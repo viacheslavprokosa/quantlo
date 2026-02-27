@@ -8,19 +8,20 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"quantlo/internal/model"
+	"quantlo/internal/service"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 )
 
+// Compile-time assertion: LedgerRepo must implement service.LedgerService.
+var _ service.LedgerService = (*LedgerRepo)(nil)
+
 //go:embed spend.lua
 var spendLuaScript string
-
-type SpendResult struct {
-	NewBalance int64  `json:"new_balance"`
-	Status     string `json:"status"`
-}
 
 var (
 	ErrAlreadyProcessed = errors.New("request already processed (idempotency)")
@@ -30,99 +31,42 @@ var (
 )
 
 type LedgerRepo struct {
-	rdb      *redis.Client
-	db       *pgxpool.Pool
-	natsConn *nats.Conn
+	rdb *redis.Client
+	db  *pgxpool.Pool
+	bus MessageBus
 }
 
-func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool, natsConn *nats.Conn) *LedgerRepo {
+func NewLedgerRepo(rdb *redis.Client, db *pgxpool.Pool, bus MessageBus) *LedgerRepo {
 	return &LedgerRepo{
-		rdb:      rdb,
-		db:       db,
-		natsConn: natsConn,
+		rdb: rdb,
+		db:  db,
+		bus: bus,
 	}
 }
 
-func (r *LedgerRepo) Spend(ctx context.Context, accountID, resourceType, idempotencyKey string, amount int64) (*SpendResult, error) {
-	result, err := r.executeLua(ctx, accountID, resourceType, idempotencyKey, amount)
+func (r *LedgerRepo) Spend(ctx context.Context, req model.SpendRequest) (*model.SpendResult, error) {
+	result, err := r.executeLua(ctx, req)
 
 	if errors.Is(err, ErrCacheMiss) {
-		slog.Info("cold start, warming up cache", "account_id", accountID, "resource", resourceType)
+		slog.Info("cold start, warming up cache", "account_id", req.AccountID)
 
-		if err := r.warmUpCache(ctx, accountID, resourceType); err != nil {
+		if err := r.warmUpCache(ctx, req.AccountID, req.ResourceType); err != nil {
 			return nil, err
 		}
 
-		return r.executeLua(ctx, accountID, resourceType, idempotencyKey, amount)
+		return r.executeLua(ctx, req)
 	}
 
 	return result, err
 }
 
-func (r *LedgerRepo) CreateAccount(ctx context.Context, accountID, resourceType string, initialAmount int64) error {
-    query := `
-        INSERT INTO balances (account_id, resource_type, amount, created_at, updated_at)
-        VALUES ($1, $2, $3, NOW(), NOW())
-        ON CONFLICT (account_id, resource_type) DO NOTHING`
-
-    res, err := r.db.Exec(ctx, query, accountID, resourceType, initialAmount)
-    if err != nil {
-        return fmt.Errorf("failed to create account: %w", err)
-    }
-
-    if res.RowsAffected() == 0 {
-        return errors.New("account already exists")
-    }
-
-    cacheKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-    _ = r.rdb.Set(ctx, cacheKey, initialAmount, 0).Err()
-
-    return nil
-}
-
-func (r *LedgerRepo) DeleteAccount(ctx context.Context, accountID, resourceType string) error {
+func (r *LedgerRepo) Recharge(ctx context.Context, req model.RechargeRequest) error {
 	query := `
-		UPDATE balances 
-		SET deleted_at = NOW(), updated_at = NOW() 
-		WHERE account_id = $1 AND resource_type = $2 AND deleted_at IS NULL`
+        UPDATE balances 
+        SET amount = amount + $1, updated_at = NOW() 
+        WHERE account_id = $2 AND resource_type = $3 AND deleted_at IS NULL`
 
-	res, err := r.db.Exec(ctx, query, accountID, resourceType)
-	
-	if err != nil {
-		return fmt.Errorf("failed to soft delete account: %w", err)
-	}
-
-	if res.RowsAffected() == 0 {
-		return errors.New("account not found or already deleted")
-	}
-
-	// Clear Redis
-	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-	
-	// Use Pipeline for speed
-	pipe := r.rdb.Pipeline()
-	pipe.Del(ctx, balanceKey)
-	// Lock account in Redis for a short period (Tombstone), 
-	// so even Cold Start doesn't try to raise it 5-10 seconds.
-	pipe.Set(ctx, fmt.Sprintf("deleted:%s:%s", accountID, resourceType), "1", 30*time.Second)
-	
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		slog.Error("redis cleanup failed during deletion", "error", err)
-	}
-
-	slog.Info("account marked as deleted", "account_id", accountID, "type", resourceType)
-
-	return nil
-}
-
-func (r *LedgerRepo) Recharge(ctx context.Context, accountID, resourceType string, amount int64) error {
-	query := `
-		UPDATE balances 
-		SET amount = amount + $1, updated_at = NOW() 
-		WHERE account_id = $2 AND resource_type = $3`
-
-	res, err := r.db.Exec(ctx, query, amount, accountID, resourceType)
+	res, err := r.db.Exec(ctx, query, req.Amount, req.AccountID, req.ResourceType)
 	if err != nil {
 		return fmt.Errorf("db recharge error: %w", err)
 	}
@@ -131,57 +75,8 @@ func (r *LedgerRepo) Recharge(ctx context.Context, accountID, resourceType strin
 		return ErrNotFoundInDB
 	}
 
-	cacheKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-	if err := r.rdb.Del(ctx, cacheKey).Err(); err != nil {
-		slog.Error("failed to invalidate cache", "key", cacheKey, "error", err)
-	}
-
-	slog.Info("balance recharged successfully", "account_id", accountID, "amount", amount)
-	return nil
-}
-
-func (r *LedgerRepo) SyncTransactionWithBalance(ctx context.Context, event SpendEvent) error {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	var insertedKey string
-	queryInsert := `
-		INSERT INTO transactions (account_id, resource_type, amount, idempotency_key, created_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING idempotency_key`
-
-	err = tx.QueryRow(ctx, queryInsert,
-		event.AccountID, event.ResourceType, event.Amount, event.IdempotencyKey, event.CreatedAt,
-	).Scan(&insertedKey)
-
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("transaction insert failed: %w", err)
-	}
-
-	if insertedKey == "" {
-		slog.Debug("skipping duplicate transaction", "key", event.IdempotencyKey)
-		return nil
-	}
-
-	queryUpdate := `
-		UPDATE balances 
-		SET amount = amount - $1, updated_at = NOW() 
-		WHERE account_id = $2 AND resource_type = $3`
-
-	res, err := tx.Exec(ctx, queryUpdate, event.Amount, event.AccountID, event.ResourceType)
-	if err != nil {
-		return fmt.Errorf("balance update failed: %w", err)
-	}
-
-	if res.RowsAffected() == 0 {
-		return fmt.Errorf("no balance record to update for %s", event.AccountID)
-	}
-
-	return tx.Commit(ctx)
+	cacheKey := fmt.Sprintf("balance:%s:%s", req.AccountID, req.ResourceType)
+	return r.rdb.Del(ctx, cacheKey).Err()
 }
 
 func (r *LedgerRepo) GetBalance(ctx context.Context, accountID, resourceType string) (int64, error) {
@@ -193,38 +88,104 @@ func (r *LedgerRepo) GetBalance(ctx context.Context, accountID, resourceType str
 	}
 
 	if errors.Is(err, redis.Nil) {
-		slog.Info("balance cache miss, fetching from db", "account_id", accountID)
-		
 		if err := r.warmUpCache(ctx, accountID, resourceType); err != nil {
 			return 0, err
 		}
-
 		return r.rdb.Get(ctx, balanceKey).Int64()
 	}
 
-	return 0, fmt.Errorf("redis error: %w", err)
+	return 0, err
 }
 
-func (r *LedgerRepo) executeLua(ctx context.Context, accountID, resourceType, idempotencyKey string, amount int64) (*SpendResult, error) {
-	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-	idemKey := fmt.Sprintf("idem:%s", idempotencyKey)
+func (r *LedgerRepo) CreateAccount(ctx context.Context, accountID, resourceType string, initialAmount int64) error {
+	query := `
+        INSERT INTO balances (account_id, resource_type, amount, created_at, updated_at)
+        VALUES ($1, $2, $3, NOW(), NOW())
+        ON CONFLICT (account_id, resource_type) DO NOTHING`
 
-	result, err := r.rdb.Eval(ctx, spendLuaScript, []string{balanceKey, idemKey}, amount).Result()
+	res, err := r.db.Exec(ctx, query, accountID, resourceType, initialAmount)
 	if err != nil {
-		return nil, fmt.Errorf("lua error: %w", err)
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return errors.New("account already exists")
 	}
 
-	resArray, ok := result.([]interface{})
-	if !ok || len(resArray) < 2 {
-		return nil, errors.New("invalid redis response format")
+	cacheKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
+	return r.rdb.Set(ctx, cacheKey, initialAmount, 0).Err()
+}
+
+func (r *LedgerRepo) DeleteAccount(ctx context.Context, accountID, resourceType string) error {
+	query := `
+        UPDATE balances 
+        SET deleted_at = NOW(), updated_at = NOW() 
+        WHERE account_id = $1 AND resource_type = $2 AND deleted_at IS NULL`
+
+	res, err := r.db.Exec(ctx, query, accountID, resourceType)
+	if err != nil {
+		return fmt.Errorf("db delete account: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFoundInDB
 	}
 
+	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
+	pipe := r.rdb.Pipeline()
+	pipe.Del(ctx, balanceKey)
+	pipe.Set(ctx, fmt.Sprintf("deleted:%s:%s", accountID, resourceType), "1", 30*time.Second)
+	_, err = pipe.Exec(ctx)
+
+	return err
+}
+
+func (r *LedgerRepo) SyncTransactionWithBalance(ctx context.Context, event model.SpendEvent) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var insertedKey string
+	queryInsert := `
+        INSERT INTO transactions (account_id, resource_type, amount, idempotency_key, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING idempotency_key`
+
+	err = tx.QueryRow(ctx, queryInsert,
+		event.AccountID, event.ResourceType, event.Amount, event.IdempotencyKey, event.CreatedAt,
+	).Scan(&insertedKey)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if insertedKey == "" {
+		return nil
+	}
+
+	queryUpdate := `UPDATE balances SET amount = amount - $1 WHERE account_id = $2 AND resource_type = $3`
+	_, err = tx.Exec(ctx, queryUpdate, event.Amount, event.AccountID, event.ResourceType)
+
+	return tx.Commit(ctx)
+}
+
+func (r *LedgerRepo) executeLua(ctx context.Context, req model.SpendRequest) (*model.SpendResult, error) {
+	balanceKey := fmt.Sprintf("balance:%s:%s", req.AccountID, req.ResourceType)
+	idemKey := fmt.Sprintf("idem:%s", req.IdempotencyKey)
+
+	result, err := r.rdb.Eval(ctx, spendLuaScript, []string{balanceKey, idemKey}, req.Amount).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	resArray := result.([]interface{})
 	status := resArray[0].(int64)
+
 	switch status {
 	case 1:
 		newBalance := resArray[1].(int64)
-		r.publishEvent(accountID, resourceType, idempotencyKey, amount)
-		return &SpendResult{NewBalance: newBalance, Status: "SUCCESS"}, nil
+		r.publishEvent(req)
+		return &model.SpendResult{NewBalance: newBalance, Status: "SUCCESS"}, nil
 	case 0:
 		return nil, ErrAlreadyProcessed
 	case -1:
@@ -249,25 +210,24 @@ func (r *LedgerRepo) warmUpCache(ctx context.Context, accountID, resourceType st
 		}
 		return err
 	}
-
 	if deletedAt != nil {
 		return errors.New("account is deleted")
 	}
 
-	balanceKey := fmt.Sprintf("balance:%s:%s", accountID, resourceType)
-	return r.rdb.Set(ctx, balanceKey, currentBalance, 0).Err()
+	return r.rdb.Set(ctx, fmt.Sprintf("balance:%s:%s", accountID, resourceType), currentBalance, 0).Err()
 }
 
-func (r *LedgerRepo) publishEvent(accID, resType, idemKey string, amount int64) {
-	event := SpendEvent{
-		AccountID:      accID,
-		ResourceType:   resType,
-		Amount:         amount,
-		IdempotencyKey: idemKey,
+func (r *LedgerRepo) publishEvent(req model.SpendRequest) {
+	event := model.SpendEvent{
+		AccountID:      req.AccountID,
+		ResourceType:   req.ResourceType,
+		Amount:         req.Amount,
+		IdempotencyKey: req.IdempotencyKey,
 		CreatedAt:      time.Now(),
 	}
 	data, _ := json.Marshal(event)
-	if err := r.natsConn.Publish("transactions.created", data); err != nil {
-		slog.Error("nats publish failed", "error", err, "key", idemKey)
+
+	if err := r.bus.Publish("transactions.created", data); err != nil {
+		slog.Error("event publish failed", "error", err, "topic", "transactions.created")
 	}
 }
