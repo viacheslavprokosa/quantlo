@@ -26,7 +26,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
 }
 
 func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {

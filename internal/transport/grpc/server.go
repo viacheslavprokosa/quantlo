@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"quantlo/internal/model"
 	"quantlo/internal/proto"
@@ -12,6 +13,7 @@ import (
 
 type Server struct {
 	proto.UnimplementedLedgerServiceServer
+	proto.UnimplementedEventServiceServer
 	svc  service.LedgerService
 	srv  *grpc.Server
 	addr string
@@ -20,6 +22,7 @@ type Server struct {
 func NewServer(addr string, svc service.LedgerService) *Server {
 	s := &Server{svc: svc, addr: addr, srv: grpc.NewServer()}
 	proto.RegisterLedgerServiceServer(s.srv, s)
+	proto.RegisterEventServiceServer(s.srv, s)
 	return s
 }
 
@@ -63,4 +66,17 @@ func (s *Server) Recharge(ctx context.Context, req *proto.RechargeRequest) (*pro
 		return &proto.RechargeResponse{Success: false, ErrorMessage: err.Error()}, nil
 	}
 	return &proto.RechargeResponse{Success: true, Status: "SUCCESS"}, nil
+}
+
+func (s *Server) Publish(ctx context.Context, req *proto.EventRequest) (*proto.EventResponse, error) {
+	var event model.SpendEvent
+	if err := json.Unmarshal(req.Payload, &event); err != nil {
+		return &proto.EventResponse{Success: false}, err
+	}
+
+	if err := s.svc.SyncTransactionWithBalance(ctx, event); err != nil {
+		return &proto.EventResponse{Success: false}, err
+	}
+
+	return &proto.EventResponse{Success: true}, nil
 }

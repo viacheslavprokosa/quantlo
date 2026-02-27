@@ -2,7 +2,6 @@ package infrastructure
 
 import (
 	"context"
-	"log/slog"
 	"quantlo/internal/config"
 	"quantlo/internal/repository"
 	"quantlo/internal/service"
@@ -34,15 +33,14 @@ func Bootstrap(ctx context.Context) (*App, func(), error) {
 	var cleanupFns []func()
 	cleanupFns = append(cleanupFns, func() {
 		db.Close()
-		rdb.Close()
+		_ = rdb.Close()
 	})
 
-	// ── Bus wiring ────────────────────────────────────────────────────────────
-	// Bus is resolved first so it can be injected into the repository.
+	// ── Infrastructure wiring ──────────────────────────────────────────────────
 	var bus repository.MessageBus
-
 	var servers []Server
 
+	// 1. Bus setup
 	switch cfg.BusProvider {
 	case "nats":
 		nc, err := connectNats(cfg.NatsAddr())
@@ -52,27 +50,25 @@ func Bootstrap(ctx context.Context) (*App, func(), error) {
 		bus = transportNATS.NewBus(nc)
 		cleanupFns = append(cleanupFns, nc.Close)
 
-		// Repository + service depend on bus, so build them here inside the case.
+		// NATS needs handlers to process commands/syncs
 		repo := repository.NewLedgerRepo(rdb, db, bus)
 		var svc service.LedgerService = repo
 
-		// NATS command handler (subscribe to commands.spend / commands.recharge)
+		// If worker is NATS, add the worker
+		if cfg.WorkerProvider == "nats" {
+			servers = append(servers, worker.NewTransactionWorker(svc, nc))
+		}
+		// NATS can also handle commands
 		servers = append(servers, transportNATS.NewHandler(svc, nc))
-		// DB-sync worker (subscribe to transactions.created)
-		servers = append(servers, worker.NewTransactionWorker(svc, nc))
 
-		// gRPC server (available as a separate transport)
+		// Other transports
 		servers = append(servers, transportGRPC.NewServer(":50051", svc))
-
-		// HTTP server (optional)
 		if addr, apiErr := cfg.ApiAddr(); apiErr == nil {
 			servers = append(servers, transportHTTP.NewServer(addr, svc))
-		} else {
-			slog.Info("HTTP API disabled", "reason", apiErr)
 		}
 
 	case "grpc":
-		grpcBus, cleanup, err := transportGRPC.NewGrpcBusFromAddr(cfg.GRPCAddr())
+		grpcBus, cleanup, err := transportGRPC.NewGrpcBusFromAddr(cfg.GRPCAddr(), cfg.BusBufferSize)
 		if err != nil {
 			return nil, runCleanup(cleanupFns), err
 		}
@@ -82,12 +78,11 @@ func Bootstrap(ctx context.Context) (*App, func(), error) {
 		repo := repository.NewLedgerRepo(rdb, db, bus)
 		var svc service.LedgerService = repo
 
+		// gRPC server acts as worker if WorkerProvider is "grpc" (handled in Server.Publish)
 		servers = append(servers, transportGRPC.NewServer(":50051", svc))
 
 		if addr, apiErr := cfg.ApiAddr(); apiErr == nil {
 			servers = append(servers, transportHTTP.NewServer(addr, svc))
-		} else {
-			slog.Info("HTTP API disabled", "reason", apiErr)
 		}
 	}
 

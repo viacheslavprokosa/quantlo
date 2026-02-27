@@ -2,6 +2,7 @@ package infrastructure
 
 import (
 	"context"
+
 	"golang.org/x/sync/errgroup"
 )
 
@@ -26,7 +27,7 @@ func (a *App) Run(ctx context.Context) error {
 	<-ctx.Done()
 
 	for _, srv := range a.servers {
-		srv.Stop(context.Background())
+		_ = srv.Stop(context.Background())
 	}
 
 	return g.Wait()

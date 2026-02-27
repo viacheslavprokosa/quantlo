@@ -143,7 +143,7 @@ func (r *LedgerRepo) SyncTransactionWithBalance(ctx context.Context, event model
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var insertedKey string
 	queryInsert := `
@@ -164,7 +164,9 @@ func (r *LedgerRepo) SyncTransactionWithBalance(ctx context.Context, event model
 	}
 
 	queryUpdate := `UPDATE balances SET amount = amount - $1 WHERE account_id = $2 AND resource_type = $3`
-	_, err = tx.Exec(ctx, queryUpdate, event.Amount, event.AccountID, event.ResourceType)
+	if _, err = tx.Exec(ctx, queryUpdate, event.Amount, event.AccountID, event.ResourceType); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
 }

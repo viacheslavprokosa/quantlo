@@ -8,21 +8,23 @@ import (
 )
 
 type Config struct {
-	DBUser      string
-	DBPass      string
-	DBHost      string
-	DBPort      string
-	DBName      string
-	SSLMode     string
-	RedisHost   string
-	RedisPort   string
-	NatsHost    string
-	NatsPort    string
-	ApiPort     string
-	BusProvider string
-	GRPCHost    string
-	GRPCPort    string
-	ApiEnabled  string
+	DBUser         string
+	DBPass         string
+	DBHost         string
+	DBPort         string
+	DBName         string
+	SSLMode        string
+	RedisHost      string
+	RedisPort      string
+	NatsHost       string
+	NatsPort       string
+	ApiPort        string
+	BusProvider    string
+	GRPCHost       string
+	GRPCPort       string
+	ApiEnabled     string
+	BusBufferSize  int
+	WorkerProvider string
 }
 
 // New loads and validates configuration from environment variables.
@@ -32,21 +34,23 @@ func New() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		DBUser:      os.Getenv("QANTLO_POSTGRES_USER"),
-		DBPass:      os.Getenv("QANTLO_POSTGRES_PASSWORD"),
-		DBHost:      os.Getenv("QANTLO_POSTGRES_HOST"),
-		DBPort:      os.Getenv("QANTLO_POSTGRES_PORT"),
-		DBName:      os.Getenv("QANTLO_POSTGRES_DB"),
-		SSLMode:     os.Getenv("QANTLO_POSTGRES_SSLMODE"),
-		RedisHost:   os.Getenv("QANTLO_REDIS_HOST"),
-		RedisPort:   os.Getenv("QANTLO_REDIS_PORT"),
-		NatsHost:    os.Getenv("QANTLO_NATS_HOST"),
-		NatsPort:    os.Getenv("QANTLO_NATS_PORT"),
-		GRPCHost:    os.Getenv("QANTLO_GRPC_HOST"),
-		GRPCPort:    os.Getenv("QANTLO_GRPC_PORT"),
-		BusProvider: os.Getenv("QANTLO_BUS_PROVIDER"),
-		ApiPort:     os.Getenv("QANTLO_API_PORT"),
-		ApiEnabled:  os.Getenv("QANTLO_API_ENABLED"),
+		DBUser:         os.Getenv("QANTLO_POSTGRES_USER"),
+		DBPass:         os.Getenv("QANTLO_POSTGRES_PASSWORD"),
+		DBHost:         os.Getenv("QANTLO_POSTGRES_HOST"),
+		DBPort:         os.Getenv("QANTLO_POSTGRES_PORT"),
+		DBName:         os.Getenv("QANTLO_POSTGRES_DB"),
+		SSLMode:        os.Getenv("QANTLO_POSTGRES_SSLMODE"),
+		RedisHost:      os.Getenv("QANTLO_REDIS_HOST"),
+		RedisPort:      os.Getenv("QANTLO_REDIS_PORT"),
+		NatsHost:       os.Getenv("QANTLO_NATS_HOST"),
+		NatsPort:       os.Getenv("QANTLO_NATS_PORT"),
+		GRPCHost:       os.Getenv("QANTLO_GRPC_HOST"),
+		GRPCPort:       os.Getenv("QANTLO_GRPC_PORT"),
+		BusProvider:    os.Getenv("QANTLO_BUS_PROVIDER"),
+		ApiPort:        os.Getenv("QANTLO_API_PORT"),
+		ApiEnabled:     os.Getenv("QANTLO_API_ENABLED"),
+		BusBufferSize:  getEnvInt("QANTLO_BUS_BUFFER_SIZE", 1024),
+		WorkerProvider: os.Getenv("QANTLO_WORKER_PROVIDER"),
 	}
 
 	// Required: database
@@ -65,6 +69,14 @@ func New() (*Config, error) {
 	}
 	if cfg.BusProvider != "nats" && cfg.BusProvider != "grpc" {
 		return nil, fmt.Errorf("invalid bus provider %q, must be 'nats' or 'grpc'", cfg.BusProvider)
+	}
+
+	// Required: worker provider (default to bus provider if empty)
+	if cfg.WorkerProvider == "" {
+		cfg.WorkerProvider = cfg.BusProvider
+	}
+	if cfg.WorkerProvider != "nats" && cfg.WorkerProvider != "grpc" {
+		return nil, fmt.Errorf("invalid worker provider %q, must be 'nats' or 'grpc'", cfg.WorkerProvider)
 	}
 	if cfg.BusProvider == "grpc" && (cfg.GRPCHost == "" || cfg.GRPCPort == "") {
 		return nil, fmt.Errorf("missing required env for grpc bus: QANTLO_GRPC_HOST/PORT")
@@ -114,4 +126,16 @@ func (c *Config) BusAddr() string {
 		return c.NatsAddr()
 	}
 	return c.GRPCAddr()
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	var intVal int
+	if _, err := fmt.Sscanf(val, "%d", &intVal); err != nil {
+		return defaultVal
+	}
+	return intVal
 }

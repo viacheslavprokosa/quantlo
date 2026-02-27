@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"time"
+
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
@@ -21,7 +22,7 @@ func RunMigrations(ctx context.Context, dsn string, command string) error {
 	if err != nil {
 		return fmt.Errorf("sql open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	goose.SetBaseFS(embedMigrations)
 

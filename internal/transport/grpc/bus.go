@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"log/slog"
 	"quantlo/internal/proto"
 
 	"google.golang.org/grpc"
@@ -13,24 +14,53 @@ import (
 type GrpcBus struct {
 	conn   *grpc.ClientConn
 	client proto.EventServiceClient
+	events chan *proto.EventRequest
 }
 
 // NewGrpcBusFromAddr dials the remote EventService and returns a GrpcBus and a cleanup function.
-func NewGrpcBusFromAddr(addr string) (*GrpcBus, func(), error) {
+func NewGrpcBusFromAddr(addr string, bufferSize int) (*GrpcBus, func(), error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, nil, err
 	}
 	client := proto.NewEventServiceClient(conn)
-	cleanup := func() { conn.Close() }
-	return &GrpcBus{conn: conn, client: client}, cleanup, nil
+	events := make(chan *proto.EventRequest, bufferSize)
+
+	bus := &GrpcBus{
+		conn:   conn,
+		client: client,
+		events: events,
+	}
+
+	go bus.worker()
+
+	cleanup := func() {
+		close(events)
+		_ = conn.Close()
+	}
+	return bus, cleanup, nil
 }
 
-// Publish sends an event to the remote EventService.
+func (b *GrpcBus) worker() {
+	for req := range b.events {
+		// Use a fresh context for each publish since it's background
+		_, err := b.client.Publish(context.Background(), req)
+		if err != nil {
+			slog.Error("grpc bus: async publish failed", "topic", req.Topic, "error", err)
+		}
+	}
+}
+
+// Publish sends an event to the remote EventService asynchronously.
 func (b *GrpcBus) Publish(topic string, data []byte) error {
-	_, err := b.client.Publish(context.Background(), &proto.EventRequest{
+	select {
+	case b.events <- &proto.EventRequest{
 		Topic:   topic,
 		Payload: data,
-	})
-	return err
+	}:
+		return nil
+	default:
+		slog.Warn("grpc bus: buffer full, dropping event", "topic", topic)
+		return nil
+	}
 }
